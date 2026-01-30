@@ -10,6 +10,10 @@ A lightweight, hybrid voice recognition engine for web applications that combine
 - **ONNX ASR** - Fast, on-device speech transcription using Moonshine models
 - **Continuous Listening** - Always-on wake word monitoring with minimal resource usage
 
+## Demo
+
+Simple demo at: https://76836.github.io/AkariNet-AudioConsole
+
 ## Quick Start
 
 ```javascript
