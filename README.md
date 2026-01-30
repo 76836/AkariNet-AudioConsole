@@ -13,7 +13,7 @@ A lightweight, hybrid voice recognition engine for web applications that combine
 ## Quick Start
 
 ```javascript
-import { AkarinetVoice } from './akarinetVoice.js';
+import { AkarinetVoice } from 'https://76836.github.io/AkariNet-AudioConsole/audioConsole-3.3.0.js';
 
 const voice = new AkarinetVoice({
     wakewords: ['hey akari', 'computer', 'jarvis'],
