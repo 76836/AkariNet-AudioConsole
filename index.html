@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Audio Console demo</title>
+</head>
+
+<body>
+    <h1>AkariNet Audio Console demo</h1>
+    <button id="start-btn">Initialize</button>
+    <div id="logs" style="font-family: monospace; margin-top: 20px;"></div>
+
+    <script type="module">
+        import { AkarinetVoice } from 'https://76836.github.io/AkariNet-AudioConsole/audioConsole-3.3.0.js';
+
+        const btn = document.getElementById('start-btn');
+        const logs = document.getElementById('logs');
+
+        function log(msg) {
+            const div = document.createElement('div');
+            div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logs.prepend(div);
+        }
+
+        btn.onclick = async () => {
+            if (window.voiceInit) return;
+            window.voiceInit = true;
+            btn.innerText = "Loading...";
+
+            const config = {
+                modelId: "onnx-community/moonshine-tiny-ONNX",
+                modelQuantization: "q8",
+                wakewords: ["hey akari", "hey, akari", "akari"],
+                wakesoundURL: "https://teachablemachine.withgoogle.com/models/SwNFRUBwu/",
+                wakesoundThreshold: 0.75,
+                wakesoundIndex: 2,
+                wakesoundDuration: 750,
+                wakesoundDelay: 5000,
+                requireWakeSound: false,
+                vadThreshold: 0.75,
+                cleanup: false,
+                debugWakeSound: false
+            };
+
+            const assistant = new AkarinetVoice(config);
+
+            assistant.addEventListener('ready', () => {
+                btn.innerText = "Online";
+                log("System ready.");
+            });
+
+            assistant.addEventListener('wakesound', (e) => log(`Wake: ${e.detail.class}`));
+            assistant.addEventListener('result', (e) => log(`ASR: ${e.detail.text}`));
+            assistant.addEventListener('error', (e) => log(`Error: ${e.detail}`));
+
+            await assistant.init();
+        };
+    </script>
+</body>
+
+</html>
