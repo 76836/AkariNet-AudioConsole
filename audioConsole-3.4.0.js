@@ -16,22 +16,23 @@ export class AkarinetVoice extends EventTarget {
             wakesoundURL: config.wakesoundURL || null,
             wakesoundThreshold: config.wakesoundThreshold || 0.75,
             wakesoundIndex: config.wakesoundIndex || 2,
-            wakesoundDuration: config.wakesoundDuration || 1000,
+            wakesoundDuration: config.wakesoundDuration || 100,
             wakesoundDelay: config.wakesoundDelay || 0,
             vadThreshold: config.vadThreshold || 0.75,
-            wakeChimeURL: config.wakeChimeURL || null,
             cleanup: config.cleanup !== undefined ? config.cleanup : true,
             debugWakeSound: config.debugWakeSound || false,
             requireWakeSound: config.requireWakeSound || false
         };
         
-        this.asr = null;
+        this._asrWorker = null;
+        this._asrCallbacks = new Map();
+        this._asrCallId = 0;
         this.vad = null;
         this.recognizer = null;
         this.wakeSoundDetectedTime = null;
         this.lastWakeSoundScore = 0;
         this.speechStartTime = 0;
-        this.wakeChimeAudio = null;
+        this._isProcessing = false;
         
         this._logInitialized = false;
     }
@@ -50,12 +51,6 @@ export class AkarinetVoice extends EventTarget {
 
             await this._loadExternalScripts();
 
-            if (this.config.wakeChimeURL) {
-                await this._loadWakeChime();
-            }
-            
-            const { pipeline } = await import('https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1');
-
             if (this.config.wakesoundURL) {
                 await this._loadTensorFlowScripts();
                 await this._initWakeSoundModel();
@@ -63,9 +58,7 @@ export class AkarinetVoice extends EventTarget {
             }
 
             this._log('INFO', `Loading ASR model: ${this.config.modelId} (${this.config.modelQuantization})...`);
-            this.asr = await pipeline("automatic-speech-recognition", this.config.modelId, {
-                dtype: this.config.modelQuantization
-            });
+            await this._initASRWorker();
             this._log('OK', 'ASR model loaded.');
 
             this._log('INFO', 'Initializing Voice Activity Detection...');
@@ -97,54 +90,6 @@ export class AkarinetVoice extends EventTarget {
             this._log('ERROR', `Initialization failed: ${e.message}`);
             this.dispatchEvent(new CustomEvent('error', { detail: e.message }));
         }
-    }
-
-    async _loadWakeChime() {
-        this._log('INFO', `Preloading wake chime: ${this.config.wakeChimeURL}`);
-        const audio = new Audio(this.config.wakeChimeURL);
-        audio.preload = 'auto';
-
-        await new Promise((resolve, reject) => {
-            const onReady = () => {
-                cleanup();
-                resolve();
-            };
-            const onError = () => {
-                cleanup();
-                reject(new Error('Failed to load wake chime audio file.'));
-            };
-            const cleanup = () => {
-                audio.removeEventListener('canplaythrough', onReady);
-                audio.removeEventListener('error', onError);
-            };
-
-            audio.addEventListener('canplaythrough', onReady, { once: true });
-            audio.addEventListener('error', onError, { once: true });
-            audio.load();
-        });
-
-        this.wakeChimeAudio = audio;
-        this._log('OK', 'Wake chime preloaded.');
-    }
-
-    _playWakeChime() {
-        if (!this.wakeChimeAudio) return;
-
-        setTimeout(() => {
-            try {
-                const chime = this.wakeChimeAudio.cloneNode(true);
-                chime.currentTime = 0;
-                chime.play().catch(() => {
-                    if (this.config.debugWakeSound) {
-                        this._log('WARN', 'Wake chime playback was blocked by the browser.');
-                    }
-                });
-            } catch (e) {
-                if (this.config.debugWakeSound) {
-                    this._log('WARN', `Wake chime playback failed: ${e.message}`);
-                }
-            }
-        }, 0);
     }
 
     async _loadExternalScripts() {
@@ -218,8 +163,6 @@ export class AkarinetVoice extends EventTarget {
                     this._log('OK', `Wake sound detected with score: ${targetScore.toFixed(4)}`);
                 }
 
-                this._playWakeChime();
-
                 this.dispatchEvent(new CustomEvent('wakesound', {
                     detail: {
                         score: targetScore,
@@ -242,26 +185,52 @@ export class AkarinetVoice extends EventTarget {
             return;
         }
 
+        if (this._isProcessing) {
+            this.dispatchEvent(new CustomEvent('speechdiscarded', { detail: "(Busy Processing)" }));
+            return;
+        }
+
+        // Snapshot before the sync wait loop. The continuous wake sound listener keeps
+        // running during speech and can overwrite wakeSoundDetectedTime with a spurious
+        // detection mid-utterance. Capturing here ensures long speech isn't penalised.
+        const wakeSoundAtSpeechStart = this.wakeSoundDetectedTime;
+
         const maxSyncWait = 600;
         const startSync = Date.now();
         while (Date.now() - startSync < maxSyncWait) {
             if (this.wakeSoundDetectedTime && this.wakeSoundDetectedTime > this.speechStartTime) break;
-            if (this.wakeSoundDetectedTime && (Date.now() - this.wakeSoundDetectedTime > this.config.wakesoundDelay)) break;
+            if (this.wakeSoundDetectedTime && (Date.now() - this.wakeSoundDetectedTime > this.config.wakesoundDuration)) break;
 
             await new Promise(r => setTimeout(r, 50));
         }
 
-        const hasWakeSound = !!this.wakeSoundDetectedTime;
-        const startedAfterWake = hasWakeSound && this.speechStartTime >= this.wakeSoundDetectedTime;
-        const startDelay = hasWakeSound ? (this.speechStartTime - this.wakeSoundDetectedTime) : Infinity;
-        const inSession = startedAfterWake && startDelay <= this.config.wakesoundDelay;
+        // A late detection is one that arrived after speech started (caught by the wait loop).
+        // For everything else use the pre-speech snapshot so spurious in-speech detections
+        // don't invalidate the session.
+        const lateDetection = (this.wakeSoundDetectedTime && this.wakeSoundDetectedTime > this.speechStartTime)
+            ? this.wakeSoundDetectedTime
+            : null;
+        const relevantWakeTime = lateDetection || wakeSoundAtSpeechStart;
+
+        let inSession = false;
+        if (relevantWakeTime) {
+            if (lateDetection) {
+                // Fired after speech started — always counts as in-session
+                inSession = true;
+            } else {
+                // Fired before speech — check it was within the session window
+                const timeSinceWakeSound = this.speechStartTime - relevantWakeTime;
+                inSession = timeSinceWakeSound >= 0 && timeSinceWakeSound < this.config.wakesoundDuration;
+            }
+        }
 
         if (inSession) {
             let audioToProcess = audio;
 
-            if (this.wakeSoundDetectedTime >= this.speechStartTime) {
-                const offsetMs = (this.wakeSoundDetectedTime - this.speechStartTime);
-                const trimSamples = Math.max(0, Math.floor((offsetMs / 1000) * 16000));
+            if (lateDetection) {
+                // Wake sound fired during the utterance — trim the leading overlap
+                const offsetMs = lateDetection - this.speechStartTime;
+                const trimSamples = Math.floor((offsetMs / 1000) * 16000);
 
                 if (audio.length > trimSamples) {
                     audioToProcess = audio.slice(trimSamples);
@@ -282,9 +251,85 @@ export class AkarinetVoice extends EventTarget {
         }
     }
 
-    async _transcribeAndParse(audio, wakeSoundDetected) {
+    async _initASRWorker() {
+        // Inline worker source — loaded as an ES module so it can import transformers.js.
+        // Runs in its own thread, keeping WASM computation off the main thread entirely.
+        const workerSrc = `
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1';
+env.allowLocalModels = false;
+
+let asr = null;
+
+self.onmessage = async ({ data }) => {
+    if (data.type === 'init') {
         try {
-            const { text } = await this.asr(audio);
+            asr = await pipeline('automatic-speech-recognition', data.modelId, {
+                dtype: data.modelQuantization
+            });
+            self.postMessage({ type: 'ready' });
+        } catch (e) {
+            self.postMessage({ type: 'initError', message: e.message });
+        }
+    } else if (data.type === 'transcribe') {
+        try {
+            const { text } = await asr(data.audio);
+            self.postMessage({ type: 'result', id: data.id, text });
+        } catch (e) {
+            self.postMessage({ type: 'transcribeError', id: data.id, message: e.message });
+        }
+    }
+};
+`;
+        const blob = new Blob([workerSrc], { type: 'text/javascript' });
+        this._asrWorker = new Worker(URL.createObjectURL(blob), { type: 'module' });
+
+        // One-time listener just for the init handshake
+        await new Promise((resolve, reject) => {
+            const onInit = ({ data }) => {
+                if (data.type !== 'ready' && data.type !== 'initError') return;
+                this._asrWorker.removeEventListener('message', onInit);
+                data.type === 'ready' ? resolve() : reject(new Error(data.message));
+            };
+            this._asrWorker.addEventListener('message', onInit);
+            this._asrWorker.postMessage({
+                type: 'init',
+                modelId: this.config.modelId,
+                modelQuantization: this.config.modelQuantization
+            });
+        });
+
+        // Persistent listener for transcription responses — routes by call ID
+        this._asrWorker.addEventListener('message', ({ data }) => {
+            if (data.type !== 'result' && data.type !== 'transcribeError') return;
+            const cb = this._asrCallbacks.get(data.id);
+            if (cb) {
+                this._asrCallbacks.delete(data.id);
+                cb(data);
+            }
+        });
+    }
+
+    _runASR(audio) {
+        return new Promise((resolve, reject) => {
+            const id = this._asrCallId++;
+            this._asrCallbacks.set(id, (data) => {
+                data.type === 'result'
+                    ? resolve(data.text)
+                    : reject(new Error(data.message));
+            });
+            // Copy the Float32Array so we own the buffer before transferring.
+            // Transferring (not copying) across postMessage means zero overhead
+            // regardless of audio length.
+            const copy = new Float32Array(audio);
+            this._asrWorker.postMessage({ type: 'transcribe', id, audio: copy }, [copy.buffer]);
+        });
+    }
+
+    async _transcribeAndParse(audio, wakeSoundDetected) {
+        this._isProcessing = true;
+        this.dispatchEvent(new Event('processing'));
+        try {
+            const text = await this._runASR(audio);
             if (!text) {
                 this.dispatchEvent(new CustomEvent('speechdiscarded', { detail: "(Empty Recognition)" }));
                 return;
@@ -293,6 +338,9 @@ export class AkarinetVoice extends EventTarget {
         } catch (e) {
             this._log('ERROR', `ASR transcription failed: ${e.message}`);
             this.dispatchEvent(new CustomEvent('error', { detail: "ASR Fail: " + e.message }));
+        } finally {
+            this._isProcessing = false;
+            this.dispatchEvent(new Event('processingend'));
         }
     }
 
@@ -326,10 +374,6 @@ export class AkarinetVoice extends EventTarget {
             return;
         }
 
-        if (!wakeSoundDetected) {
-            this._playWakeChime();
-        }
-
         if (this.config.cleanup) {
             cmd = cmd.replace(/[^\w\s\+\-\*\/\(\)\.]/g, ' ').replace(/\s+/g, ' ').trim();
         }
@@ -347,6 +391,20 @@ export class AkarinetVoice extends EventTarget {
         }
     }
 
+    /**
+     * Manually trigger a wake word session — call this from a button click or
+     * any other UI event. Behaves identically to a real wake sound detection:
+     * the next utterance captured by VAD will be transcribed and parsed as if
+     * the wake word had been spoken aloud.
+     */
+    activateWakeWord() {
+        const now = Date.now();
+        this.wakeSoundDetectedTime = now;
+        this.dispatchEvent(new CustomEvent('wakesound', {
+            detail: { score: 1, class: 'manual', timestamp: now }
+        }));
+    }
+
     async destroy() {
         this._log('INFO', 'Shutting down AkariNet Audio Console...');
         
@@ -356,6 +414,11 @@ export class AkarinetVoice extends EventTarget {
 
         if (this.vad) {
             await this.vad.pause();
+        }
+
+        if (this._asrWorker) {
+            this._asrWorker.terminate();
+            this._asrWorker = null;
         }
         
         this._restoreConsoleLogs();
