@@ -280,6 +280,46 @@ const OWW_MODEL_FILE_MAP = {
     weather: 'weather_v0.1.onnx'
 };
 
+/**
+ * Default URLs for the 3 core openWakeWord preprocessing models.
+ * Sourced from the openwakeword_wasm repo via jsdelivr GitHub CDN
+ * (serves with Access-Control-Allow-Origin: *, no auth required).
+ *
+ * These 3 models are required by every keyword model — they form the
+ * preprocessing pipeline (audio → melspectrogram → embedding → VAD gate).
+ * The keyword model is just the final classification head.
+ *
+ * Override per-instance via OpenWakeWordProvider config.coreModelURLs.
+ */
+const OWW_DEFAULT_CORE_URLS = {
+    melspectrogram: 'https://cdn.jsdelivr.net/gh/dnavarrom/openwakeword_wasm@main/models/melspectrogram.onnx',
+    embedding:      'https://cdn.jsdelivr.net/gh/dnavarrom/openwakeword_wasm@main/models/embedding_model.onnx',
+    vad:            'https://cdn.jsdelivr.net/gh/dnavarrom/openwakeword_wasm@main/models/silero_vad.onnx'
+};
+
+/**
+ * Extract a keyword name from a model URL filename.
+ * Examples:
+ *   '.../hey_akari_v0.1.onnx'   → 'hey_akari'
+ *   '.../alexa_v0.1.onnx'       → 'alexa'
+ *   '.../custom_wake_word.onnx' → 'custom_wake_word'
+ *   '.../model.onnx'            → 'model'
+ */
+function extractKeywordNameFromURL(url) {
+    const filename = url.split('/').pop() || 'keyword';
+    const withoutExt = filename.replace(/\.onnx$/i, '');
+    const withoutVersion = withoutExt.replace(/_v\d+\.\d+$/i, '');
+    return withoutVersion || 'keyword';
+}
+
+/**
+ * Returns true if a string is an absolute URL (http:// or https://).
+ * Used to distinguish direct URLs from filenames-relative-to-baseAssetUrl.
+ */
+function isURL(s) {
+    return typeof s === 'string' && /^https?:\/\//i.test(s);
+}
+
 const OWW_AUDIO_PROCESSOR_CODE = `
 class AudioProcessor extends AudioWorkletProcessor {
     bufferSize = 1280;
@@ -311,6 +351,7 @@ class _WakeWordEngine {
         keywords = ['hey_jarvis'],
         modelFiles = OWW_MODEL_FILE_MAP,
         baseAssetUrl = '/models',
+        coreModelURLs = OWW_DEFAULT_CORE_URLS,
         ortWasmPath,
         frameSize = 1280,
         sampleRate = 16000,
@@ -322,7 +363,7 @@ class _WakeWordEngine {
         debug = false
     } = {}) {
         this.config = {
-            keywords, modelFiles, baseAssetUrl, frameSize, sampleRate,
+            keywords, modelFiles, baseAssetUrl, coreModelURLs, frameSize, sampleRate,
             vadHangoverFrames, detectionThreshold, cooldownMs,
             executionProviders, embeddingWindowSize, debug
         };
@@ -355,24 +396,27 @@ class _WakeWordEngine {
         }
         const sessionOptions = { executionProviders: this.config.executionProviders };
         const resolver = (file) => `${this.config.baseAssetUrl.replace(/\/+$/, '')}/${file}`;
+        // Resolve a model source: direct URL if it looks like one, else filename relative to baseAssetUrl.
+        const resolveSource = (fileOrUrl) => isURL(fileOrUrl) ? fileOrUrl : resolver(fileOrUrl);
         this._debug('Loading core models with options', sessionOptions);
 
-        this._melspecModel = await ort.InferenceSession.create(resolver('melspectrogram.onnx'), sessionOptions);
-        this._embeddingModel = await ort.InferenceSession.create(resolver('embedding_model.onnx'), sessionOptions);
-        this._vadModel = await ort.InferenceSession.create(resolver('silero_vad.onnx'), sessionOptions);
+        // Core models: load from coreModelURLs (defaults to jsdelivr GH CDN of openwakeword_wasm repo).
+        this._melspecModel = await ort.InferenceSession.create(this.config.coreModelURLs.melspectrogram, sessionOptions);
+        this._embeddingModel = await ort.InferenceSession.create(this.config.coreModelURLs.embedding, sessionOptions);
+        this._vadModel = await ort.InferenceSession.create(this.config.coreModelURLs.vad, sessionOptions);
 
         this._keywordModels = {};
         let maxWindowSize = this.config.embeddingWindowSize;
         for (const keyword of this.config.keywords) {
-            const file = this.config.modelFiles[keyword];
-            if (!file) throw new Error(`No model file configured for keyword "${keyword}"`);
-            const session = await ort.InferenceSession.create(resolver(file), sessionOptions);
+            const source = this.config.modelFiles[keyword];
+            if (!source) throw new Error(`No model file or URL configured for keyword "${keyword}"`);
+            const session = await ort.InferenceSession.create(resolveSource(source), sessionOptions);
             const windowSize = this._inferKeywordWindowSize(session) ?? this.config.embeddingWindowSize;
             maxWindowSize = Math.max(maxWindowSize, windowSize);
             const history = [];
             for (let i = 0; i < windowSize; i++) history.push(new Float32Array(96).fill(0));
             this._keywordModels[keyword] = { session, scores: new Array(50).fill(0), windowSize, history };
-            this._debug('Loaded keyword model', { keyword, file, windowSize });
+            this._debug('Loaded keyword model', { keyword, source, windowSize });
         }
         this._embeddingWindowSize = maxWindowSize;
         this._debug('Embedding window size resolved', this._embeddingWindowSize);
@@ -582,10 +626,27 @@ class _WakeWordEngine {
 /**
  * OpenWakeWord provider — wraps _WakeWordEngine with the WakeWordProvider contract.
  *
- * Config keys (all optional unless noted):
- *   baseAssetUrl:        string  URL to folder containing the .onnx files (REQUIRED)
- *   keywords:            string[]  e.g. ['hey_jarvis'] (default: ['hey_jarvis'])
- *   modelFiles:          Object  Map of keyword → filename (default: OWW_MODEL_FILE_MAP)
+ * THREE WAYS TO SPECIFY KEYWORD MODELS (pick one):
+ *
+ * 1. Single URL (simplest — just point at any CORS-accessible .onnx file):
+ *    { keywordURL: 'https://huggingface.co/yourname/hey_akari/resolve/main/hey_akari_v0.1.onnx' }
+ *    - Keyword name is auto-extracted from the filename (e.g. "hey_akari").
+ *    - Override with keywordName: 'custom_name' if needed.
+ *
+ * 2. Multiple URLs (array of URL strings, or array of { url, name } objects):
+ *    { keywordURLs: [
+ *        'https://huggingface.co/.../hey_akari_v0.1.onnx',
+ *        { url: 'https://huggingface.co/.../alexa_v0.1.onnx', name: 'alexa' }
+ *    ] }
+ *
+ * 3. Legacy (filename + baseAssetUrl, for self-hosted model directories):
+ *    { baseAssetUrl: 'https://your-host/models', keywords: ['hey_jarvis'] }
+ *
+ * CORE MODELS (melspectrogram, embedding, VAD):
+ *   Auto-loaded from jsdelivr GitHub CDN (openwakeword_wasm repo) by default.
+ *   Override individually via coreModelURLs: { melspectrogram: '...', embedding: '...', vad: '...' }.
+ *
+ * Other config keys (all optional):
  *   detectionThreshold:  number  0..1 (default 0.5)
  *   cooldownMs:          number  ms between detections (default 2000)
  *   vadHangoverFrames:   number  keep speech-active window open this many frames after VAD drops (default 12)
@@ -601,6 +662,50 @@ class OpenWakeWordProvider extends WakeWordProvider {
         this._engine = null;
     }
 
+    /**
+     * Build the { keywords, modelFiles } pair for _WakeWordEngine from the
+     * various config shapes the user might pass:
+     *   1. keywordURL: 'https://...' (single URL string)
+     *   2. keywordURLs: ['https://...', { url, name }] (array of URLs or objects)
+     *   3. keywords: ['hey_jarvis'] + modelFiles: { hey_jarvis: 'filename.onnx' } + baseAssetUrl (legacy)
+     */
+    _resolveKeywordConfig() {
+        const cfg = this.config;
+
+        // Case 1: single keywordURL
+        if (cfg.keywordURL) {
+            const name = cfg.keywordName || extractKeywordNameFromURL(cfg.keywordURL);
+            return {
+                keywords: [name],
+                modelFiles: { [name]: cfg.keywordURL }
+            };
+        }
+
+        // Case 2: array of keywordURLs (strings or { url, name } objects)
+        if (Array.isArray(cfg.keywordURLs) && cfg.keywordURLs.length > 0) {
+            const keywords = [];
+            const modelFiles = {};
+            for (const entry of cfg.keywordURLs) {
+                if (typeof entry === 'string') {
+                    const name = extractKeywordNameFromURL(entry);
+                    keywords.push(name);
+                    modelFiles[name] = entry;
+                } else if (entry && typeof entry === 'object' && entry.url) {
+                    const name = entry.name || extractKeywordNameFromURL(entry.url);
+                    keywords.push(name);
+                    modelFiles[name] = entry.url;
+                }
+            }
+            return { keywords, modelFiles };
+        }
+
+        // Case 3: legacy — keywords array + modelFiles map + baseAssetUrl
+        return {
+            keywords: cfg.keywords ?? ['hey_jarvis'],
+            modelFiles: cfg.modelFiles ?? OWW_MODEL_FILE_MAP
+        };
+    }
+
     async init() {
         this._log('INFO', 'Initializing openWakeWord engine...');
 
@@ -611,10 +716,17 @@ class OpenWakeWordProvider extends WakeWordProvider {
             await loadScript('https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js');
         }
 
+        const { keywords, modelFiles } = this._resolveKeywordConfig();
+
         const engineConfig = {
-            keywords: this.config.keywords ?? ['hey_jarvis'],
-            modelFiles: this.config.modelFiles ?? OWW_MODEL_FILE_MAP,
+            keywords,
+            modelFiles,
+            // baseAssetUrl only matters for legacy file-based loading (when modelFiles
+            // values are filenames, not URLs). Ignored for URL-based entries.
             baseAssetUrl: this.config.baseAssetUrl ?? '/models',
+            // Core model URLs: default to jsdelivr GH CDN of openwakeword_wasm repo.
+            // Override per-instance via config.coreModelURLs.
+            coreModelURLs: { ...OWW_DEFAULT_CORE_URLS, ...(this.config.coreModelURLs || {}) },
             ortWasmPath: this.config.ortWasmPath,
             detectionThreshold: this.config.detectionThreshold ?? 0.5,
             cooldownMs: this.config.cooldownMs ?? 2000,
@@ -858,13 +970,28 @@ export class AkarinetVoice extends EventTarget {
 
             case 'openwakeword': {
                 const oww = this.config.openWakeWord || {};
-                if (!oww.baseAssetUrl) {
-                    throw new Error("wakeWordProvider='openwakeword' requires openWakeWord.baseAssetUrl");
+                // Validate: must have at least one keyword source.
+                const hasKeywordSource = oww.keywordURL
+                    || (Array.isArray(oww.keywordURLs) && oww.keywordURLs.length > 0)
+                    || oww.baseAssetUrl;
+                if (!hasKeywordSource) {
+                    throw new Error(
+                        "wakeWordProvider='openwakeword' requires one of: " +
+                        "openWakeWord.keywordURL, openWakeWord.keywordURLs, or openWakeWord.baseAssetUrl"
+                    );
                 }
                 return new OpenWakeWordProvider({
+                    // URL-based (new, simplest):
+                    keywordURL: oww.keywordURL,
+                    keywordName: oww.keywordName,
+                    keywordURLs: oww.keywordURLs,
+                    // Legacy (filename + baseAssetUrl):
                     baseAssetUrl: oww.baseAssetUrl,
-                    keywords: oww.keywords ?? ['hey_jarvis'],
+                    keywords: oww.keywords,
                     modelFiles: oww.modelFiles,
+                    // Core model overrides (optional — defaults to jsdelivr CDN):
+                    coreModelURLs: oww.coreModelURLs,
+                    // Common:
                     detectionThreshold: oww.detectionThreshold ?? 0.5,
                     cooldownMs: oww.cooldownMs ?? 2000,
                     vadHangoverFrames: oww.vadHangoverFrames ?? 12,
