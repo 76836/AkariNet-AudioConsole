@@ -216,6 +216,7 @@ class TeachableMachineProvider extends WakeWordProvider {
                 this._log('DEBUG', `Score: ${targetScore.toFixed(4)} (threshold: ${threshold})`);
             }
 
+           
             if (targetScore > threshold && targetScore < 1.62) {
                 const detail = {
                     score: targetScore,
@@ -352,6 +353,7 @@ class _WakeWordEngine {
         modelFiles = OWW_MODEL_FILE_MAP,
         baseAssetUrl = '/models',
         coreModelURLs = OWW_DEFAULT_CORE_URLS,
+        ort,                  // <-- REQUIRED: onnxruntime-web namespace, passed in explicitly
         ortWasmPath,
         frameSize = 1280,
         sampleRate = 16000,
@@ -362,12 +364,14 @@ class _WakeWordEngine {
         embeddingWindowSize = 16,
         debug = false
     } = {}) {
+        if (!ort) throw new Error('_WakeWordEngine: `ort` (onnxruntime-web namespace) must be passed in the constructor config.');
+        this._ort = ort;
         this.config = {
             keywords, modelFiles, baseAssetUrl, coreModelURLs, frameSize, sampleRate,
             vadHangoverFrames, detectionThreshold, cooldownMs,
             executionProviders, embeddingWindowSize, debug
         };
-        if (ortWasmPath && typeof ort !== 'undefined') {
+        if (ortWasmPath) {
             ort.env.wasm.wasmPaths = ortWasmPath;
         }
         this._emitter = createEmitter();
@@ -391,9 +395,7 @@ class _WakeWordEngine {
 
     async load() {
         if (this._loaded) return;
-        if (typeof ort === 'undefined') {
-            throw new Error('_WakeWordEngine: global `ort` (onnxruntime-web) not found. Load it before calling load().');
-        }
+        const ort = this._ort;
         const sessionOptions = { executionProviders: this.config.executionProviders };
         const resolver = (file) => `${this.config.baseAssetUrl.replace(/\/+$/, '')}/${file}`;
         // Resolve a model source: direct URL if it looks like one, else filename relative to baseAssetUrl.
@@ -488,6 +490,7 @@ class _WakeWordEngine {
     }
 
     _resetState() {
+        const ort = this._ort;
         this._melBuffer = [];
         const vadShape = [2, 1, 64];
         if (!this._vadState.h) {
@@ -538,6 +541,7 @@ class _WakeWordEngine {
     }
 
     async _runVad(chunk) {
+        const ort = this._ort;
         try {
             const tensor = new ort.Tensor('float32', chunk, [1, chunk.length]);
             const sr = new ort.Tensor('int64', [BigInt(this.config.sampleRate)], []);
@@ -554,6 +558,7 @@ class _WakeWordEngine {
     }
 
     async _runInference(chunk, isSpeechActive, emitEvents) {
+        const ort = this._ort;
         const melspecTensor = new ort.Tensor('float32', chunk, [1, this.config.frameSize]);
         const melspecResults = await this._melspecModel.run({ [this._melspecModel.inputNames[0]]: melspecTensor });
         const newMelData = melspecResults[this._melspecModel.outputNames[0]].data;
@@ -709,12 +714,36 @@ class OpenWakeWordProvider extends WakeWordProvider {
     async init() {
         this._log('INFO', 'Initializing openWakeWord engine...');
 
-        // AkarinetVoice loads onnxruntime-web globally before instantiating providers,
-        // but be defensive — load it ourselves if missing.
-        if (typeof ort === 'undefined') {
-            this._log('INFO', 'Global ort not found — loading onnxruntime-web...');
-            await loadScript('https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js');
+        // Resolve the onnxruntime-web namespace. Priority:
+        //   1. Explicit `ort` passed via config (advanced users)
+        //   2. Global `ort` loaded by AkarinetVoice orchestrator (normal path —
+        //      the orchestrator loads ORT globally for vad-web anyway)
+        //   3. Dynamic ESM import from jsdelivr (fallback for standalone use)
+        //
+        // We MUST resolve ort explicitly and pass it into _WakeWordEngine —
+        // relying on a bare `ort` reference inside the engine class doesn't
+        // work reliably in ESM contexts (the global may exist but not be
+        // visible to the module's lexical scope at the right time).
+        let ortNS = this.config.ort;
+        if (!ortNS && typeof globalThis !== 'undefined' && globalThis.ort) {
+            ortNS = globalThis.ort;
         }
+        if (!ortNS && typeof window !== 'undefined' && window.ort) {
+            ortNS = window.ort;
+        }
+        if (!ortNS) {
+            this._log('INFO', 'Global ort not found — loading onnxruntime-web ESM build...');
+            try {
+                const mod = await import(/* @vite-ignore */ 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.23.2/+esm');
+                ortNS = mod.default || mod;
+            } catch (e) {
+                throw new Error(`OpenWakeWordProvider: failed to load onnxruntime-web: ${e.message}`);
+            }
+        }
+        if (!ortNS || !ortNS.InferenceSession) {
+            throw new Error('OpenWakeWordProvider: onnxruntime-web loaded but InferenceSession not found.');
+        }
+        this._ort = ortNS;
 
         const { keywords, modelFiles } = this._resolveKeywordConfig();
 
@@ -727,6 +756,7 @@ class OpenWakeWordProvider extends WakeWordProvider {
             // Core model URLs: default to jsdelivr GH CDN of openwakeword_wasm repo.
             // Override per-instance via config.coreModelURLs.
             coreModelURLs: { ...OWW_DEFAULT_CORE_URLS, ...(this.config.coreModelURLs || {}) },
+            ort: ortNS,  // pass the resolved namespace explicitly
             ortWasmPath: this.config.ortWasmPath,
             detectionThreshold: this.config.detectionThreshold ?? 0.5,
             cooldownMs: this.config.cooldownMs ?? 2000,
@@ -869,7 +899,7 @@ export class AkarinetVoice extends EventTarget {
 
     async init() {
         try {
-            this._log('INFO', 'Welcome to AkariNet Audio Console v4.0!');
+            this._log('INFO', 'Welcome to AkariNet Audio Console v4.0! 0x2');
             this._log('INFO', `Wake word provider: ${this.config.wakeWordProvider}`);
 
             const needOrt = (this.config.wakeWordProvider === 'openwakeword');
@@ -880,11 +910,13 @@ export class AkarinetVoice extends EventTarget {
                 this._suppressLibraryLogs();
             }
 
-            // 1) Load shared external scripts (ORT if needed, vad-web always).
+            // 1) Load external scripts:
+            //    - onnxruntime-web (UMD bundle) — REQUIRED globally by vad-web,
+            //      which uses it internally to run the Silero VAD model. Also
+            //      used by the OWW provider if selected.
+            //    - vad-web — voice activity detection for speech boundary capture.
+            await loadScript('https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js');
             await loadScript('https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.7/dist/bundle.min.js');
-            if (needOrt) {
-                await loadScript('https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.js');
-            }
 
             // 2) Instantiate + init the wake word provider.
             this.wakeWordProvider = this._createProvider();
@@ -991,6 +1023,9 @@ export class AkarinetVoice extends EventTarget {
                     modelFiles: oww.modelFiles,
                     // Core model overrides (optional — defaults to jsdelivr CDN):
                     coreModelURLs: oww.coreModelURLs,
+                    // Optional: pass your own onnxruntime-web namespace (otherwise
+                    // the provider will dynamically import the ESM build from jsdelivr).
+                    ort: oww.ort,
                     // Common:
                     detectionThreshold: oww.detectionThreshold ?? 0.5,
                     cooldownMs: oww.cooldownMs ?? 2000,
