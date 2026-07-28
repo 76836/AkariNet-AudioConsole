@@ -2,60 +2,103 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Audio Console demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AkariNet Audio Console v4.1 Demo</title>
+    <style>
+        body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; }
+        h1 { font-size: 1.4rem; }
+        button { padding: 0.6rem 1.2rem; font-size: 1rem; cursor: pointer; }
+        #logs { font-family: ui-monospace, monospace; font-size: 0.85rem; margin-top: 1.5rem;
+                 max-height: 60vh; overflow-y: auto; border: 1px solid #ccc; padding: 0.75rem; }
+        .log-line { margin: 0.15rem 0; }
+        .ok { color: #0a0; }
+        .err { color: #c00; }
+        .wake { color: #06c; }
+    </style>
 </head>
-
 <body>
-    <h1>AkariNet Audio Console demo</h1>
+    <h1>AkariNet Audio Console <small>v4.1</small></h1>
+    <p>Single-mic voice engine with openWakeWord + Moonshine ASR.</p>
     <button id="start-btn">Initialize</button>
-    <div id="logs" style="font-family: monospace; margin-top: 20px;"></div>
+    <button id="wake-btn" disabled>Activate Wake (manual)</button>
+    <div id="logs"></div>
 
     <script type="module">
-        import { AkarinetVoice } from 'https://76836.github.io/AkariNet-AudioConsole/audioConsole-3.3.0.js';
+        import { AkarinetVoice } from 'https://76836.github.io/AkariNet-AudioConsole/audioConsole-4.1.0.js';
 
-        const btn = document.getElementById('start-btn');
-        const logs = document.getElementById('logs');
+        const startBtn = document.getElementById('start-btn');
+        const wakeBtn  = document.getElementById('wake-btn');
+        const logs     = document.getElementById('logs');
 
-        function log(msg) {
+        function log(msg, cls = '') {
             const div = document.createElement('div');
+            div.className = 'log-line ' + cls;
             div.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
             logs.prepend(div);
         }
 
-        btn.onclick = async () => {
-            if (window.voiceInit) return;
-            window.voiceInit = true;
-            btn.innerText = "Loading...";
+        let voice = null;
 
-            const config = {
-                modelId: "onnx-community/moonshine-tiny-ONNX",
-                modelQuantization: "q8",
-                wakewords: ["hey akari", "hey, akari", "akari"],
-                wakesoundURL: "https://teachablemachine.withgoogle.com/models/SwNFRUBwu/",
-                wakesoundThreshold: 0.75,
-                wakesoundIndex: 2,
-                wakesoundDuration: 750,
-                wakesoundDelay: 5000,
+        startBtn.onclick = async () => {
+            if (voice) return;
+            startBtn.disabled = true;
+            startBtn.textContent = 'Loading…';
+
+            voice = new AkarinetVoice({
+                wakewords: ['hey akari', 'hey, akari', 'akari'],
+                wakeWordProvider: 'openwakeword',
+                openWakeWord: {
+                    // Demo uses a built-in openWakeWord model; replace with your own .onnx URL
+                    keywordURL: 'https://cdn.jsdelivr.net/gh/dnavarrom/openwakeword_wasm@main/models/hey_jarvis_v0.1.onnx',
+                    detectionThreshold: 0.5
+                },
+                speechRecognitionProvider: 'transformers',
+                modelId: 'onnx-community/moonshine-tiny-ONNX',
+                modelQuantization: 'q8',
+                vadThreshold: 0.5,
                 requireWakeSound: false,
-                vadThreshold: 0.75,
-                cleanup: false,
+                cleanup: true,
                 debugWakeSound: false
-            };
-
-            const assistant = new AkarinetVoice(config);
-
-            assistant.addEventListener('ready', () => {
-                btn.innerText = "Online";
-                log("System ready.");
             });
 
-            assistant.addEventListener('wakesound', (e) => log(`Wake: ${e.detail.class}`));
-            assistant.addEventListener('result', (e) => log(`ASR: ${e.detail.text}`));
-            assistant.addEventListener('error', (e) => log(`Error: ${e.detail}`));
+            voice.addEventListener('ready', () => {
+                startBtn.textContent = 'Online';
+                wakeBtn.disabled = false;
+                log('System ready.', 'ok');
+            });
 
-            await assistant.init();
+            voice.addEventListener('wakesound', (e) => {
+                log(`Wake: ${e.detail.class} (score ${e.detail.score?.toFixed?.(3) ?? e.detail.score})`, 'wake');
+            });
+
+            voice.addEventListener('result', (e) => {
+                log(`ASR → ${e.detail.text}`, 'ok');
+            });
+
+            voice.addEventListener('speechdiscarded', (e) => {
+                log(`Discarded: ${e.detail}`);
+            });
+
+            voice.addEventListener('error', (e) => {
+                log(`Error: ${e.detail}`, 'err');
+            });
+
+            try {
+                await voice.init();
+            } catch (err) {
+                log(`Init failed: ${err.message}`, 'err');
+                startBtn.disabled = false;
+                startBtn.textContent = 'Retry';
+                voice = null;
+            }
+        };
+
+        wakeBtn.onclick = () => {
+            if (voice) {
+                voice.activateWakeWord();
+                log('Manual wake triggered.', 'wake');
+            }
         };
     </script>
 </body>
-
 </html>
