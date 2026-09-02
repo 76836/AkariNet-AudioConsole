@@ -17,14 +17,14 @@
     </style>
 </head>
 <body>
-    <h1>AkariNet Audio Console <small>v4.1</small></h1>
+    <h1>AkariNet Audio Console <small>v4.1.2</small></h1>
     <p>Single-mic voice engine with openWakeWord + Moonshine ASR.</p>
     <button id="start-btn">Initialize</button>
     <button id="wake-btn" disabled>Activate Wake (manual)</button>
     <div id="logs"></div>
 
     <script type="module">
-        import { AkarinetVoice } from 'https://76836.github.io/AkariNet-AudioConsole/audioConsole-4.1.0.js';
+        import { AkarinetVoice } from './audioConsole-4.1.2.js';
 
         const startBtn = document.getElementById('start-btn');
         const wakeBtn  = document.getElementById('wake-btn');
@@ -48,7 +48,6 @@
                 wakewords: ['hey akari', 'hey, akari', 'akari'],
                 wakeWordProvider: 'openwakeword',
                 openWakeWord: {
-                    // Demo uses a built-in openWakeWord model; replace with your own .onnx URL
                     keywordURL: 'https://cdn.jsdelivr.net/gh/dnavarrom/openwakeword_wasm@main/models/hey_jarvis_v0.1.onnx',
                     detectionThreshold: 0.5
                 },
