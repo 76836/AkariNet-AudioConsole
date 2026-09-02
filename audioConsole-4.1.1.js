@@ -355,10 +355,17 @@ AkarinetVoice.prototype.activateWakeWord = function activateWakeWord(opts) {
         : (typeof this.config.manualListenMs === 'number' ? this.config.manualListenMs : 12000);
     this._armUntil = Date.now() + Math.max(1500, listenMs);
     this._armKind = o.kind || 'manual';
-    // Stamp wake time so existing inSession logic also sees a recent wake
-    this.wakeSoundDetectedTime = Date.now();
-    this.lastWakeSoundScore = 1;
-    return _ac411OrigActivate.call(this);
+    // Call _onWakeDetect directly so class (manual/continued) is preserved for the UI.
+    // Avoid going through the original activateWakeWord which hardcodes class:'manual'.
+    if (typeof this._onWakeDetect === 'function') {
+        this._onWakeDetect({
+            score: 1,
+            class: this._armKind,
+            timestamp: Date.now()
+        });
+    } else {
+        return _ac411OrigActivate.call(this);
+    }
 };
 
 const _ac411OrigHandleSpeech = AkarinetVoice.prototype._handleSpeech;
