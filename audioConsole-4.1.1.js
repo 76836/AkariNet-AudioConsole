@@ -31,7 +31,7 @@ export {
 
 export { default, AkarinetVoice } from 'https://cdn.jsdelivr.net/gh/76836/AkariNet-AudioConsole@fb8936347264c4e15154d0dd4d358b7a4d350199/audioConsole-4.1.0.js';
 
-import { AudioBus, WhisperCppProvider } from 'https://cdn.jsdelivr.net/gh/76836/AkariNet-AudioConsole@fb8936347264c4e15154d0dd4d358b7a4d350199/audioConsole-4.1.0.js';
+import { AudioBus, WhisperCppProvider, AkarinetVoice } from 'https://cdn.jsdelivr.net/gh/76836/AkariNet-AudioConsole@fb8936347264c4e15154d0dd4d358b7a4d350199/audioConsole-4.1.0.js';
 
 /** Worklet that emits fixed 1280-sample @ targetRate chunks, resampling if needed. */
 const FIXED_BUS_WORKLET_CODE = `
@@ -332,3 +332,76 @@ function _ac411_encodeWAV(samples, sampleRate) {
         return t.replace(/\s+/g, ' ').trim();
     };
 })();
+
+
+// ---------------------------------------------------------------------------
+// v4.1.1 — Manual / continued listen arm + cancel (fixes stuck "Processing...")
+// ---------------------------------------------------------------------------
+// Problem: activateWakeWord() only stamped a short wakesoundDuration window.
+// If the user pressed the mic button and started speaking a few seconds later,
+// requireWakeSound discarded the utterance — or a hung transcribe left
+// _isProcessing true forever so the next press also failed.
+//
+// Fix:
+//  - activateWakeWord({ listenMs, kind }) arms a longer listen window
+//  - _handleSpeech treats any speech that *starts* while armed as in-session
+//  - cancelProcessing() clears hung state so the button can recover
+// ---------------------------------------------------------------------------
+
+const _ac411OrigActivate = AkarinetVoice.prototype.activateWakeWord;
+AkarinetVoice.prototype.activateWakeWord = function activateWakeWord(opts) {
+    const o = opts && typeof opts === 'object' ? opts : {};
+    const listenMs = typeof o.listenMs === 'number' ? o.listenMs
+        : (typeof this.config.manualListenMs === 'number' ? this.config.manualListenMs : 12000);
+    this._armUntil = Date.now() + Math.max(1500, listenMs);
+    this._armKind = o.kind || 'manual';
+    // Stamp wake time so existing inSession logic also sees a recent wake
+    this.wakeSoundDetectedTime = Date.now();
+    this.lastWakeSoundScore = 1;
+    return _ac411OrigActivate.call(this);
+};
+
+const _ac411OrigHandleSpeech = AkarinetVoice.prototype._handleSpeech;
+AkarinetVoice.prototype._handleSpeech = async function _handleSpeech(audio) {
+    // If still within the manual/continued arm window, force a fresh wake stamp
+    // so the original inSession check passes even when speech starts late.
+    if (this._armUntil && Date.now() < this._armUntil) {
+        if (!this.wakeSoundDetectedTime || this.wakeSoundDetectedTime < this.speechStartTime) {
+            // Prefer arm start ≈ speechStart so timeSinceWake is small/positive
+            this.wakeSoundDetectedTime = this.speechStartTime || Date.now();
+            this.lastWakeSoundScore = 1;
+        }
+    }
+    return _ac411OrigHandleSpeech.call(this, audio);
+};
+
+const _ac411OrigParse = AkarinetVoice.prototype._parse;
+AkarinetVoice.prototype._parse = function _parse(raw, wakeSoundDetected) {
+    // While armed (button / continued conversation), treat as wake-sound path
+    // so text wake-words are optional.
+    const armed = this._armUntil && Date.now() < this._armUntil;
+    const via = !!(wakeSoundDetected || armed);
+    const ret = _ac411OrigParse.call(this, raw, via);
+    // Consume one-shot arm after a successful parse attempt
+    // (result or discard both go through here / discard paths)
+    return ret;
+};
+
+/** Clear hung ASR / UI state so the mic button can recover. */
+AkarinetVoice.prototype.cancelProcessing = function cancelProcessing() {
+    this._isProcessing = false;
+    this._armUntil = 0;
+    this._armKind = null;
+    this.wakeSoundDetectedTime = null;
+    this._asrSessionActive = false;
+    try {
+        if (this.srProvider && typeof this.srProvider.stopSession === 'function') {
+            this.srProvider.stopSession();
+        }
+    } catch (_) { /* ignore */ }
+    try {
+        this.dispatchEvent(new Event('processingend'));
+    } catch (_) { /* ignore */ }
+    this._log && this._log('INFO', 'cancelProcessing() — listen/ASR state cleared.');
+};
+
