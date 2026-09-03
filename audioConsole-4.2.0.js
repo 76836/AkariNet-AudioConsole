@@ -1,113 +1,91 @@
 /**
  * AKARINET AUDIO CONSOLE v4.2.0
  * ====================================================================
- * Drop-in compatible with v4.1.1 / v4.1.2.
+ * Fork of v4.1.2 with one additive feature: Vosk segment-based STT.
  *
- * Vosk-Browser speech recognition provider — SEGMENT-BASED (like Moonshine)
- * ====================================================================
- * Privacy contract (same as transformers / Moonshine):
- *   - Vosk does NOT listen to the live mic continuously.
- *   - AudioBus + BusVAD capture speech segments only.
- *   - ASR runs ONLY inside _handleSpeech after the wake gate
- *     (openWakeWord / manual / continued) when requireWakeSound is true.
- *   - Only FINAL transcripts are returned from transcribe(); partials are
- *     ignored for commands (they can still change as context grows).
- *   - One transcribe() call → one _parse() → one 'result' event max.
+ * What this file does NOT do:
+ *   - Does not rewrite 4.1.0 / 4.1.1 / 4.1.2 behavior
+ *   - Does not attach Vosk to the live AudioBus
+ *   - Does not use partial results as commands
+ *   - Does not mark Vosk as session-based (no parallel result path)
  *
- * speechRecognitionProvider: 'vosk'
- * vosk: { modelUrl, sampleRate, grammar? }
+ * Privacy / pipeline (identical to Moonshine / transformers):
+ *   AudioBus → BusVAD → _handleSpeech (wake gate) → srProvider.transcribe(segment)
+ *   Only FINAL Vosk text is returned from transcribe().
  *
- * Default model (CORS-friendly .tar.gz):
+ * Config:
+ *   speechRecognitionProvider: 'vosk'
+ *   vosk: { modelUrl?, sampleRate?, grammar? }
+ *
+ * Default model (CORS-friendly tar.gz):
  *   https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz
  */
 
-export * from './audioConsole-4.1.1.js';
-export { default } from './audioConsole-4.1.1.js';
+// ── Preserve entire 4.1.2 surface (includes activateWakeWord fix) ──
+export * from './audioConsole-4.1.2.js';
+export { default } from './audioConsole-4.1.2.js';
 
 import {
     SpeechRecognitionProvider,
     AkarinetVoice
-} from './audioConsole-4.1.1.js';
+} from './audioConsole-4.1.2.js';
 
+// ── Vosk loader (once) ─────────────────────────────────────────────
 const VOSK_CDN = 'https://cdn.jsdelivr.net/npm/vosk-browser@0.0.8/dist/vosk.js';
 const DEFAULT_VOSK_MODEL =
     'https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz';
 
-let _voskLoadPromise = null;
+let _voskScriptPromise = null;
 
 function loadVoskScript() {
     if (typeof window !== 'undefined' && window.Vosk) {
         return Promise.resolve(window.Vosk);
     }
-    if (_voskLoadPromise) return _voskLoadPromise;
-    _voskLoadPromise = new Promise((resolve, reject) => {
+    if (_voskScriptPromise) return _voskScriptPromise;
+    _voskScriptPromise = new Promise((resolve, reject) => {
         const s = document.createElement('script');
         s.src = VOSK_CDN;
         s.async = true;
         s.onload = () => {
             if (window.Vosk) resolve(window.Vosk);
-            else reject(new Error('vosk-browser loaded but window.Vosk is missing'));
+            else reject(new Error('vosk-browser loaded but window.Vosk missing'));
         };
-        s.onerror = () => reject(new Error('Failed to load vosk-browser from CDN'));
+        s.onerror = () => reject(new Error('Failed to load vosk-browser CDN'));
         document.head.appendChild(s);
     });
-    return _voskLoadPromise;
+    return _voskScriptPromise;
 }
 
 /**
- * VoskProvider — segment-based offline STT (Moonshine-compatible contract).
- *
- * isSessionBased = false  → orchestrator uses BusVAD + _handleSpeech + transcribe()
- * Never attaches to the live AudioBus for continuous recognition.
- * Partials are never used as commands.
+ * Segment-based Vosk STT — same contract as TransformersProvider (Moonshine).
+ * isSessionBased === false → orchestrator only calls transcribe() after VAD + wake gate.
  */
 export class VoskProvider extends SpeechRecognitionProvider {
     constructor(config = {}, debug = false) {
         super(config, debug);
         this._model = null;
-        this._recognizer = null;
-        this._vosk = null;
         this._sampleRate = config.sampleRate || 16000;
         this._modelUrl = config.modelUrl || DEFAULT_VOSK_MODEL;
         this._grammar = config.grammar || null;
-        this._destroyed = false;
         this._ready = false;
         this._busy = false;
     }
 
-    /** Segment-based: orchestrator calls transcribe() on VAD clips only. */
     get isSessionBased() {
         return false;
     }
 
     async init() {
-        this._log('INFO', `Loading Vosk model (segment mode): ${this._modelUrl}`);
-        this._vosk = await loadVoskScript();
-        this._model = await this._vosk.createModel(this._modelUrl);
-        this._createRecognizer();
+        this._log('INFO', `Vosk loading model: ${this._modelUrl}`);
+        const Vosk = await loadVoskScript();
+        this._model = await Vosk.createModel(this._modelUrl);
         this._ready = true;
-        this._log('OK', 'Vosk model ready (segment-based; no continuous mic feed).');
-    }
-
-    _createRecognizer() {
-        if (!this._model) return;
-        try {
-            if (this._recognizer && typeof this._recognizer.remove === 'function') {
-                this._recognizer.remove();
-            }
-        } catch (_) { /* ignore */ }
-        const Kaldi = this._model.KaldiRecognizer;
-        if (this._grammar) {
-            this._recognizer = new Kaldi(this._sampleRate, this._grammar);
-        } else {
-            this._recognizer = new Kaldi(this._sampleRate);
-        }
+        this._log('OK', 'Vosk ready (segment-based).');
     }
 
     /**
-     * Transcribe a single VAD-captured Float32Array segment.
-     * Waits for the FINAL result only (ignores partialresult).
-     * Fresh recognizer per call so prior audio cannot leak into the transcript.
+     * Transcribe one VAD segment. Returns FINAL text only.
+     * Fresh KaldiRecognizer per call so state cannot leak between utterances.
      */
     async transcribe(audio) {
         if (!this._ready || !this._model) {
@@ -115,93 +93,84 @@ export class VoskProvider extends SpeechRecognitionProvider {
         }
         if (!audio || !audio.length) return '';
         if (this._busy) {
-            this._log('WARN', 'transcribe() ignored — already busy');
+            this._log('WARN', 'transcribe skipped (busy)');
             return '';
         }
         this._busy = true;
 
-        // New recognizer per utterance: no residual state / double finals
-        this._createRecognizer();
-        const recognizer = this._recognizer;
+        const Kaldi = this._model.KaldiRecognizer;
+        const recognizer = this._grammar
+            ? new Kaldi(this._sampleRate, this._grammar)
+            : new Kaldi(this._sampleRate);
 
-        return new Promise((resolve) => {
-            let settled = false;
-            const finish = (text) => {
-                if (settled) return;
-                settled = true;
-                this._busy = false;
+        let finalText = '';
+
+        try {
+            await new Promise((resolve) => {
+                let settled = false;
+                const done = () => {
+                    if (settled) return;
+                    settled = true;
+                    resolve();
+                };
+
+                recognizer.on('result', (message) => {
+                    const t = (message && message.result && message.result.text) || '';
+                    if (t && t.trim()) finalText = t.trim();
+                    done();
+                });
+
+                // Partials intentionally ignored for the command path
+                recognizer.on('partialresult', () => {});
+
                 try {
-                    if (recognizer && typeof recognizer.remove === 'function') {
-                        recognizer.remove();
+                    // Feed in worklet-sized chunks (1280 @ 16 kHz ≈ 80 ms)
+                    const step = 1280;
+                    for (let i = 0; i < audio.length; i += step) {
+                        const slice = audio.subarray(i, Math.min(i + step, audio.length));
+                        recognizer.acceptWaveformFloat(slice, this._sampleRate);
                     }
-                } catch (_) { /* ignore */ }
-                resolve(String(text || '').trim());
-            };
+                    if (typeof recognizer.retrieveFinalResult === 'function') {
+                        recognizer.retrieveFinalResult();
+                    }
+                } catch (e) {
+                    this._log('WARN', `acceptWaveformFloat: ${e.message || e}`);
+                    done();
+                    return;
+                }
 
-            // FINAL only — never resolve on partialresult
-            recognizer.on('result', (message) => {
-                const text = (message && message.result && message.result.text) || '';
-                finish(text);
+                setTimeout(done, 3500);
             });
-
-            // Ignore partials for command path (they change as context grows)
-            recognizer.on('partialresult', () => { /* intentional no-op */ });
-
+        } finally {
             try {
-                if (typeof recognizer.acceptWaveformFloat === 'function') {
-                    recognizer.acceptWaveformFloat(audio, this._sampleRate);
-                } else {
-                    throw new Error('acceptWaveformFloat not available');
-                }
-                // Force end-of-utterance finalization
-                if (typeof recognizer.retrieveFinalResult === 'function') {
-                    recognizer.retrieveFinalResult();
-                }
-            } catch (e) {
-                this._log('WARN', `transcribe feed failed: ${e.message || e}`);
-                finish('');
-                return;
-            }
+                if (typeof recognizer.remove === 'function') recognizer.remove();
+            } catch (_) { /* ignore */ }
+            this._busy = false;
+        }
 
-            // Safety timeout if no final arrives
-            setTimeout(() => {
-                if (!settled) {
-                    this._log('WARN', 'transcribe() timed out waiting for final result');
-                    finish('');
-                }
-            }, 4000);
-        });
+        return finalText;
     }
 
-    async startSession() { /* segment-based: no-op */ }
-    async stopSession() { /* segment-based: no-op */ }
+    async startSession() { /* segment-based no-op */ }
+    async stopSession() { /* segment-based no-op */ }
 
     async destroy() {
-        this._destroyed = true;
         this._busy = false;
-        try {
-            if (this._recognizer && typeof this._recognizer.remove === 'function') {
-                this._recognizer.remove();
-            }
-        } catch (_) { /* ignore */ }
-        this._recognizer = null;
+        this._ready = false;
         try {
             if (this._model && typeof this._model.terminate === 'function') {
                 this._model.terminate();
             }
         } catch (_) { /* ignore */ }
         this._model = null;
-        this._ready = false;
         this._log('INFO', 'VoskProvider destroyed.');
     }
 }
 
-// ---------------------------------------------------------------------------
-// Factory only — no continuous bus attach, no partial wake, no result listeners
-// ---------------------------------------------------------------------------
+// ── Selective edit: only the speech-provider factory ───────────────
+const _createSpeechProvider412 = AkarinetVoice.prototype._createSpeechProvider;
 
-const _origCreateSpeech = AkarinetVoice.prototype._createSpeechProvider;
-AkarinetVoice.prototype._createSpeechProvider = function _createSpeechProviderVosk() {
+AkarinetVoice.prototype._createSpeechProvider = function _createSpeechProvider420() {
     if (this.config.speechRecognitionProvider === 'vosk') {
         const v = this.config.vosk || {};
         return new VoskProvider({
@@ -210,8 +179,7 @@ AkarinetVoice.prototype._createSpeechProvider = function _createSpeechProviderVo
             grammar: v.grammar || null
         }, this.config.debugWakeSound);
     }
-    return _origCreateSpeech.call(this);
+    return _createSpeechProvider412.call(this);
 };
 
-// VoskProvider already exported via `export class`.
-// AkarinetVoice + default already re-exported from 4.1.1 above.
+// Do NOT re-export AkarinetVoice / default — already provided by export * / export { default }.
