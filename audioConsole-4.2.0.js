@@ -103,52 +103,51 @@ export class VoskProvider extends SpeechRecognitionProvider {
             ? new Kaldi(this._sampleRate, this._grammar)
             : new Kaldi(this._sampleRate);
 
-        let finalText = '';
+        // Collect finals while feeding; do NOT settle on the first endpoint.
+        // Vosk often emits intermediate result events mid-buffer (silence gaps).
+        let lastFinal = '';
+        recognizer.on('result', (message) => {
+            const t = (message && message.result && message.result.text) || '';
+            if (t && t.trim()) lastFinal = t.trim();
+        });
+        recognizer.on('partialresult', () => { /* ignored for commands */ });
 
         try {
-            await new Promise((resolve) => {
-                let settled = false;
-                const done = () => {
-                    if (settled) return;
-                    settled = true;
-                    resolve();
-                };
+            const step = 1280;
+            for (let i = 0; i < audio.length; i += step) {
+                const slice = audio.subarray(i, Math.min(i + step, audio.length));
+                recognizer.acceptWaveformFloat(slice, this._sampleRate);
+            }
+            // Trailing silence helps force a final endpoint on offline segments
+            const silence = new Float32Array(this._sampleRate * 0.4); // 400ms
+            for (let i = 0; i < silence.length; i += step) {
+                recognizer.acceptWaveformFloat(
+                    silence.subarray(i, Math.min(i + step, silence.length)),
+                    this._sampleRate
+                );
+            }
+            if (typeof recognizer.retrieveFinalResult === 'function') {
+                recognizer.retrieveFinalResult();
+            }
 
-                recognizer.on('result', (message) => {
-                    const t = (message && message.result && message.result.text) || '';
-                    if (t && t.trim()) finalText = t.trim();
-                    done();
-                });
+            // Allow worker time to deliver the last final after retrieveFinalResult
+            const waitMs = 800;
+            const t0 = Date.now();
+            while (Date.now() - t0 < waitMs) {
+                await new Promise((r) => setTimeout(r, 50));
+            }
 
-                // Partials intentionally ignored for the command path
-                recognizer.on('partialresult', () => {});
-
-                try {
-                    // Feed in worklet-sized chunks (1280 @ 16 kHz ≈ 80 ms)
-                    const step = 1280;
-                    for (let i = 0; i < audio.length; i += step) {
-                        const slice = audio.subarray(i, Math.min(i + step, audio.length));
-                        recognizer.acceptWaveformFloat(slice, this._sampleRate);
-                    }
-                    if (typeof recognizer.retrieveFinalResult === 'function') {
-                        recognizer.retrieveFinalResult();
-                    }
-                } catch (e) {
-                    this._log('WARN', `acceptWaveformFloat: ${e.message || e}`);
-                    done();
-                    return;
-                }
-
-                setTimeout(done, 3500);
-            });
+            this._log('INFO', `transcribe final: "${lastFinal.slice(0, 80)}" (${audio.length} samples)`);
+            return lastFinal;
+        } catch (e) {
+            this._log('WARN', `transcribe failed: ${e.message || e}`);
+            return '';
         } finally {
             try {
                 if (typeof recognizer.remove === 'function') recognizer.remove();
             } catch (_) { /* ignore */ }
             this._busy = false;
         }
-
-        return finalText;
     }
 
     async startSession() { /* segment-based no-op */ }
