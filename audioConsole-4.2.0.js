@@ -98,46 +98,69 @@ export class VoskProvider extends SpeechRecognitionProvider {
         }
         this._busy = true;
 
+        // Own copy — acceptWaveformFloat transfers its scaled buffer; keep source intact
+        const samples = audio instanceof Float32Array ? audio : new Float32Array(audio);
+        let peak = 0;
+        for (let i = 0; i < samples.length; i++) {
+            const a = samples[i] < 0 ? -samples[i] : samples[i];
+            if (a > peak) peak = a;
+        }
+        this._log('INFO', `transcribe start: ${samples.length} samples, peak=${peak.toFixed(4)}`);
+
         const Kaldi = this._model.KaldiRecognizer;
         const recognizer = this._grammar
             ? new Kaldi(this._sampleRate, this._grammar)
             : new Kaldi(this._sampleRate);
 
-        // Collect finals while feeding; do NOT settle on the first endpoint.
-        // Vosk often emits intermediate result events mid-buffer (silence gaps).
+        // Worker creates the recognizer asynchronously — audioChunks before that are dropped
+        await new Promise((r) => setTimeout(r, 120));
+
         let lastFinal = '';
-        recognizer.on('result', (message) => {
-            const t = (message && message.result && message.result.text) || '';
-            if (t && t.trim()) lastFinal = t.trim();
+        let gotResultEvent = false;
+
+        const resultPromise = new Promise((resolve) => {
+            const onResult = (message) => {
+                gotResultEvent = true;
+                const t = (message && message.result && message.result.text) || '';
+                if (t && t.trim()) lastFinal = t.trim();
+                // Keep listening for a better final; settle is timed below
+            };
+            recognizer.on('result', onResult);
+            recognizer.on('partialresult', (message) => {
+                const p = (message && message.result && message.result.partial) || '';
+                if (p) this._log('DEBUG', `partial: "${String(p).slice(0, 60)}"`);
+            });
+            // Hard timeout so we never hang the orchestrator
+            setTimeout(resolve, 2500);
+            // Early settle helper used after retrieveFinalResult
+            this._voskSettle = resolve;
         });
-        recognizer.on('partialresult', () => { /* ignored for commands */ });
 
         try {
-            const step = 1280;
-            for (let i = 0; i < audio.length; i += step) {
-                const slice = audio.subarray(i, Math.min(i + step, audio.length));
-                recognizer.acceptWaveformFloat(slice, this._sampleRate);
+            if (peak < 0.001) {
+                this._log('WARN', 'audio peak near zero — VAD segment may be silence');
             }
-            // Trailing silence helps force a final endpoint on offline segments
-            const silence = new Float32Array(this._sampleRate * 0.4); // 400ms
-            for (let i = 0; i < silence.length; i += step) {
-                recognizer.acceptWaveformFloat(
-                    silence.subarray(i, Math.min(i + step, silence.length)),
-                    this._sampleRate
-                );
-            }
+
+            // One contiguous feed (not tiny slices) after recognizer exists in the worker
+            recognizer.acceptWaveformFloat(samples, this._sampleRate);
+
+            // Endpoint padding
+            const silence = new Float32Array(Math.floor(this._sampleRate * 0.5));
+            recognizer.acceptWaveformFloat(silence, this._sampleRate);
+
             if (typeof recognizer.retrieveFinalResult === 'function') {
                 recognizer.retrieveFinalResult();
             }
 
-            // Allow worker time to deliver the last final after retrieveFinalResult
-            const waitMs = 800;
-            const t0 = Date.now();
-            while (Date.now() - t0 < waitMs) {
-                await new Promise((r) => setTimeout(r, 50));
-            }
+            // Give the worker time to return final after retrieveFinalResult
+            await new Promise((r) => setTimeout(r, 400));
+            if (typeof this._voskSettle === 'function') this._voskSettle();
+            await resultPromise;
 
-            this._log('INFO', `transcribe final: "${lastFinal.slice(0, 80)}" (${audio.length} samples)`);
+            this._log(
+                'INFO',
+                `transcribe final: "${lastFinal.slice(0, 80)}" (${samples.length} samples, events=${gotResultEvent})`
+            );
             return lastFinal;
         } catch (e) {
             this._log('WARN', `transcribe failed: ${e.message || e}`);
@@ -147,6 +170,7 @@ export class VoskProvider extends SpeechRecognitionProvider {
                 if (typeof recognizer.remove === 'function') recognizer.remove();
             } catch (_) { /* ignore */ }
             this._busy = false;
+            this._voskSettle = null;
         }
     }
 
