@@ -167,11 +167,21 @@ export class VoskProvider extends SpeechRecognitionProvider {
     }
 }
 
-// ── Selective edit: only the speech-provider factory ───────────────
+// ── Selective edits (do not rewrite 4.1.x core) ────────────────────
+//
+// Core 4.1.0 hardcodes:
+//   needsVad = needsBus && (srProv === 'transformers' || srProv === 'whispercpp')
+// So speechRecognitionProvider === 'vosk' never gets BusVAD → no VAD lights,
+// no speech-end segments, no transcribe(). Moonshine works because it matches.
+//
+// Fix: for vosk only, borrow the transformers bus/VAD path during init, while
+// still constructing VoskProvider from the factory.
+
 const _createSpeechProvider412 = AkarinetVoice.prototype._createSpeechProvider;
+const _init412 = AkarinetVoice.prototype.init;
 
 AkarinetVoice.prototype._createSpeechProvider = function _createSpeechProvider420() {
-    if (this.config.speechRecognitionProvider === 'vosk') {
+    if (this.config._wantVosk || this.config.speechRecognitionProvider === 'vosk') {
         const v = this.config.vosk || {};
         return new VoskProvider({
             modelUrl: v.modelUrl || this.config.voskModelUrl || DEFAULT_VOSK_MODEL,
@@ -180,6 +190,22 @@ AkarinetVoice.prototype._createSpeechProvider = function _createSpeechProvider42
         }, this.config.debugWakeSound);
     }
     return _createSpeechProvider412.call(this);
+};
+
+AkarinetVoice.prototype.init = async function init420() {
+    const wantVosk = this.config.speechRecognitionProvider === 'vosk';
+    if (wantVosk) {
+        // Enable needsBus / needsVad / needsOrt checks inside 4.1.0 init
+        this.config._wantVosk = true;
+        this.config.speechRecognitionProvider = 'transformers';
+    }
+    try {
+        await _init412.call(this);
+    } finally {
+        if (wantVosk) {
+            this.config.speechRecognitionProvider = 'vosk';
+        }
+    }
 };
 
 // Do NOT re-export AkarinetVoice / default — already provided by export * / export { default }.
