@@ -19,7 +19,7 @@
  *   }
  *
  * Default model (small English, ~40 MB, cached by browser after first load):
- *   https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip
+ *   https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz
  * Alternative used elsewhere in Akari:
  *   https://huggingface.co/ambind/vosk-model-small-en-us-0.15/resolve/main/vosk-model-small-en-us-0.15_c_.zip
  */
@@ -38,7 +38,7 @@ import {
 // ---------------------------------------------------------------------------
 const VOSK_CDN = 'https://cdn.jsdelivr.net/npm/vosk-browser@0.0.8/dist/vosk.js';
 const DEFAULT_VOSK_MODEL =
-    'https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip';
+    'https://ccoreilly.github.io/vosk-browser/models/vosk-model-small-en-us-0.15.tar.gz';
 
 let _voskLoadPromise = null;
 
