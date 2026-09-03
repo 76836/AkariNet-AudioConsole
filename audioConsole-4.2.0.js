@@ -324,5 +324,6 @@ AkarinetVoice.prototype.destroy = async function destroyWithVosk() {
     }
 };
 
-export { VoskProvider, AkarinetVoice };
-export default AkarinetVoice;
+
+// VoskProvider already exported via `export class`.
+// AkarinetVoice + default already re-exported from 4.1.1 above.
