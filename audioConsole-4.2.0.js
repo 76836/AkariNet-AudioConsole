@@ -64,11 +64,15 @@ export class VoskProvider extends SpeechRecognitionProvider {
     constructor(config = {}, debug = false) {
         super(config, debug);
         this._model = null;
+        this._recognizer = null;
         this._sampleRate = config.sampleRate || 16000;
         this._modelUrl = config.modelUrl || DEFAULT_VOSK_MODEL;
         this._grammar = config.grammar || null;
         this._ready = false;
         this._busy = false;
+        this._onResult = null;
+        this._onError = null;
+        this._onPartial = null;
     }
 
     get isSessionBased() {
@@ -79,13 +83,144 @@ export class VoskProvider extends SpeechRecognitionProvider {
         this._log('INFO', `Vosk loading model: ${this._modelUrl}`);
         const Vosk = await loadVoskScript();
         this._model = await Vosk.createModel(this._modelUrl);
+        await this._ensureRecognizer();
         this._ready = true;
-        this._log('OK', 'Vosk ready (segment-based).');
+        this._log('OK', 'Vosk ready (segment-based, recognizer worker-acked).');
     }
 
     /**
-     * Transcribe one VAD segment. Returns FINAL text only.
-     * Fresh KaldiRecognizer per call so state cannot leak between utterances.
+     * Create KaldiRecognizer and wait until the worker confirms it exists.
+     * No fixed delays: probe with retrieveFinalResult; worker replies result or error.
+     * "Does not exist" → probe again on the next microtask after the error event.
+     */
+    async _ensureRecognizer() {
+        if (this._recognizer) return this._recognizer;
+        if (!this._model || !this._model.ready) {
+            throw new Error('Vosk model not ready');
+        }
+
+        const Kaldi = this._model.KaldiRecognizer;
+        const recognizer = this._grammar
+            ? new Kaldi(this._sampleRate, this._grammar)
+            : new Kaldi(this._sampleRate);
+
+        await new Promise((resolve, reject) => {
+            let settled = false;
+            let probes = 0;
+            const maxProbes = 200; // event-driven retries, not timed waits
+
+            const cleanup = () => {
+                if (this._onResult) {
+                    try { recognizer.removeEventListener('result', this._onResult); } catch (_) {}
+                }
+                if (this._onError) {
+                    try { recognizer.removeEventListener('error', this._onError); } catch (_) {}
+                }
+                this._onResult = null;
+                this._onError = null;
+            };
+
+            const finishOk = () => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                resolve();
+            };
+            const finishErr = (e) => {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(e instanceof Error ? e : new Error(String(e)));
+            };
+
+            // KaldiRecognizer.on wraps addEventListener and passes event.detail
+            recognizer.on('result', () => {
+                // Empty final is fine — means recognizer exists and FinalResult ran
+                finishOk();
+            });
+            recognizer.on('error', (message) => {
+                const errText = String((message && (message.error || message.message)) || message || '');
+                if (/does not exist|not exist|already been deleted/i.test(errText)) {
+                    probes += 1;
+                    if (probes > maxProbes) {
+                        finishErr(new Error('Vosk recognizer never became ready in worker'));
+                        return;
+                    }
+                    // Retry only after the worker answered — no sleep
+                    queueMicrotask(() => {
+                        try { recognizer.retrieveFinalResult(); } catch (e) { finishErr(e); }
+                    });
+                    return;
+                }
+                finishErr(new Error(errText || 'Vosk recognizer error'));
+            });
+
+            // First probe: if create is already done, result arrives; else error → retry
+            try {
+                recognizer.retrieveFinalResult();
+            } catch (e) {
+                finishErr(e);
+            }
+        });
+
+        this._recognizer = recognizer;
+        // Persistent listeners for transcription results
+        this._bindRecognizerEvents();
+        return recognizer;
+    }
+
+    _bindRecognizerEvents() {
+        const recognizer = this._recognizer;
+        if (!recognizer) return;
+
+        // Track last final / partial for the in-flight transcribe() promise
+        this._lastFinal = '';
+        this._lastPartial = '';
+        this._resultWaiters = [];
+
+        recognizer.on('result', (message) => {
+            const t = (message && message.result && message.result.text) || '';
+            if (t && t.trim()) this._lastFinal = t.trim();
+            const waiters = this._resultWaiters.splice(0);
+            for (const w of waiters) {
+                try { w(this._lastFinal); } catch (_) {}
+            }
+        });
+        recognizer.on('partialresult', (message) => {
+            const p = (message && message.result && message.result.partial) || '';
+            if (p) this._lastPartial = String(p);
+        });
+        recognizer.on('error', (message) => {
+            const errText = String((message && (message.error || message.message)) || message || '');
+            this._log('WARN', `recognizer error: ${errText}`);
+            const waiters = this._resultWaiters.splice(0);
+            for (const w of waiters) {
+                try { w(''); } catch (_) {}
+            }
+        });
+    }
+
+    /**
+     * Wait for the next worker `result` event after retrieveFinalResult.
+     * Event-driven; safety timeout only for a dead worker (not for readiness).
+     */
+    _waitNextFinal(timeoutMs = 10000) {
+        return new Promise((resolve) => {
+            let done = false;
+            const finish = (text) => {
+                if (done) return;
+                done = true;
+                resolve(text || '');
+            };
+            this._resultWaiters.push(finish);
+            // Safety only: hung worker. Not used for create-race.
+            setTimeout(() => finish(this._lastFinal || ''), timeoutMs);
+        });
+    }
+
+    /**
+     * Transcribe one VAD segment. Reuses the init-time recognizer (worker already acked).
+     * Finals only. No fixed create delays.
      */
     async transcribe(audio) {
         if (!this._ready || !this._model) {
@@ -97,80 +232,43 @@ export class VoskProvider extends SpeechRecognitionProvider {
             return '';
         }
         this._busy = true;
-
-        // Own copy — acceptWaveformFloat transfers its scaled buffer; keep source intact
-        const samples = audio instanceof Float32Array ? audio : new Float32Array(audio);
-        let peak = 0;
-        for (let i = 0; i < samples.length; i++) {
-            const a = samples[i] < 0 ? -samples[i] : samples[i];
-            if (a > peak) peak = a;
-        }
-        this._log('INFO', `transcribe start: ${samples.length} samples, peak=${peak.toFixed(4)}`);
-
-        const Kaldi = this._model.KaldiRecognizer;
-        const recognizer = this._grammar
-            ? new Kaldi(this._sampleRate, this._grammar)
-            : new Kaldi(this._sampleRate);
-
-        // Worker creates the recognizer asynchronously — audioChunks before that are dropped
-        await new Promise((r) => setTimeout(r, 120));
-
-        let lastFinal = '';
-        let gotResultEvent = false;
-
-        const resultPromise = new Promise((resolve) => {
-            const onResult = (message) => {
-                gotResultEvent = true;
-                const t = (message && message.result && message.result.text) || '';
-                if (t && t.trim()) lastFinal = t.trim();
-                // Keep listening for a better final; settle is timed below
-            };
-            recognizer.on('result', onResult);
-            recognizer.on('partialresult', (message) => {
-                const p = (message && message.result && message.result.partial) || '';
-                if (p) this._log('DEBUG', `partial: "${String(p).slice(0, 60)}"`);
-            });
-            // Hard timeout so we never hang the orchestrator
-            setTimeout(resolve, 2500);
-            // Early settle helper used after retrieveFinalResult
-            this._voskSettle = resolve;
-        });
+        this._lastFinal = '';
+        this._lastPartial = '';
 
         try {
+            const recognizer = await this._ensureRecognizer();
+            const samples = audio instanceof Float32Array ? audio : new Float32Array(audio);
+
+            let peak = 0;
+            for (let i = 0; i < samples.length; i++) {
+                const a = samples[i] < 0 ? -samples[i] : samples[i];
+                if (a > peak) peak = a;
+            }
+            this._log('INFO', `transcribe start: ${samples.length} samples, peak=${peak.toFixed(4)}`);
             if (peak < 0.001) {
                 this._log('WARN', 'audio peak near zero — VAD segment may be silence');
             }
 
-            // One contiguous feed (not tiny slices) after recognizer exists in the worker
+            // Drain any stale waiters from a previous call
+            this._resultWaiters.splice(0);
+
             recognizer.acceptWaveformFloat(samples, this._sampleRate);
 
-            // Endpoint padding
-            const silence = new Float32Array(Math.floor(this._sampleRate * 0.5));
+            // Endpoint: short silence helps Kaldi finalize; still event-driven after
+            const silence = new Float32Array(Math.floor(this._sampleRate * 0.3));
             recognizer.acceptWaveformFloat(silence, this._sampleRate);
 
-            if (typeof recognizer.retrieveFinalResult === 'function') {
-                recognizer.retrieveFinalResult();
-            }
+            const finalPromise = this._waitNextFinal(10000);
+            recognizer.retrieveFinalResult();
+            const text = await finalPromise;
 
-            // Give the worker time to return final after retrieveFinalResult
-            await new Promise((r) => setTimeout(r, 400));
-            if (typeof this._voskSettle === 'function') this._voskSettle();
-            await resultPromise;
-
-            this._log(
-                'INFO',
-                `transcribe final: "${lastFinal.slice(0, 80)}" (${samples.length} samples, events=${gotResultEvent})`
-            );
-            return lastFinal;
+            this._log('INFO', `transcribe final: "${(text || '').slice(0, 80)}" (${samples.length} samples)`);
+            return text || '';
         } catch (e) {
             this._log('WARN', `transcribe failed: ${e.message || e}`);
             return '';
         } finally {
-            try {
-                if (typeof recognizer.remove === 'function') recognizer.remove();
-            } catch (_) { /* ignore */ }
             this._busy = false;
-            this._voskSettle = null;
         }
     }
 
@@ -180,6 +278,13 @@ export class VoskProvider extends SpeechRecognitionProvider {
     async destroy() {
         this._busy = false;
         this._ready = false;
+        this._resultWaiters = [];
+        try {
+            if (this._recognizer && typeof this._recognizer.remove === 'function') {
+                this._recognizer.remove();
+            }
+        } catch (_) { /* ignore */ }
+        this._recognizer = null;
         try {
             if (this._model && typeof this._model.terminate === 'function') {
                 this._model.terminate();
