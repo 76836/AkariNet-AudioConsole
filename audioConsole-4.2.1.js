@@ -415,7 +415,12 @@ AkarinetVoice.prototype.init = async function init421() {
         if (this.busVad) {
             this.busVad.on('speech-start', () => {
                 if (typeof this.srProvider.startStreaming === 'function') {
-                    try { this.srProvider.startStreaming(); } catch (_) {}
+                    // Only stream after wake when requireWakeSound is enabled
+                    const requireWake = !!this.config.requireWakeSound;
+                    const hasWake = !!this.wakeSoundDetectedTime;
+                    if (!requireWake || hasWake) {
+                        try { this.srProvider.startStreaming(); } catch (_) {}
+                    }
                 }
             });
             // speech-end already goes to _handleSpeech → transcribe().
