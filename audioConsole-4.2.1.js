@@ -224,11 +224,34 @@ export class VoskProvider extends SpeechRecognitionProvider {
     }
 
     /**
+     * Drop the current KaldiRecognizer and build a fresh one.
+     * Required after retrieveFinalResult so the next utterance is clean.
+     */
+    async _resetRecognizer() {
+        try {
+            if (this._recognizer && typeof this._recognizer.remove === 'function') {
+                this._recognizer.remove();
+            }
+        } catch (_) { /* ignore */ }
+        this._recognizer = null;
+        this._lastFinal = '';
+        this._lastPartial = '';
+        this._streamedSamples = 0;
+        this._resultWaiters = [];
+        try {
+            await this._ensureRecognizer();
+        } catch (e) {
+            this._log('WARN', `recognizer reset failed: ${e.message || e}`);
+        }
+    }
+
+    /**
      * Begin accepting live bus chunks. Called on VAD speech-start.
-     * Partials become available as drafts; final is still deferred.
+     * Partials are drafts only. Final is always taken after speech-end.
      */
     startStreaming() {
         if (!this._ready || !this._recognizer) return;
+        if (this._busy) return; // never stream into an in-flight finalize
         this._streaming = true;
         this._streamedSamples = 0;
         this._lastFinal = '';
@@ -246,11 +269,10 @@ export class VoskProvider extends SpeechRecognitionProvider {
     }
 
     /**
-     * Live bus chunk sink. Only consumes while _streaming is true.
-     * Progressive acceptWaveform keeps the decoder warm so final is fast.
+     * Live bus chunk sink. Only consumes while _streaming is true and not busy.
      */
     feedChunk(chunk) {
-        if (!this._streaming || !this._recognizer || !chunk || !chunk.length) return;
+        if (!this._streaming || this._busy || !this._recognizer || !chunk || !chunk.length) return;
         try {
             const samples = chunk instanceof Float32Array ? chunk : new Float32Array(chunk);
             this._recognizer.acceptWaveformFloat(samples, this._sampleRate);
@@ -278,9 +300,9 @@ export class VoskProvider extends SpeechRecognitionProvider {
 
     /**
      * Finalize after VAD speech-end.
-     * Prefer the already-streamed state (fast path). If streaming did not
-     * run or fed nothing, fall back to accepting the full segment.
-     * ALWAYS returns only the post-endpoint final text — never the last partial.
+     * Uses progressive stream when it covered this segment; otherwise feeds
+     * the full VAD buffer. ALWAYS returns only the post-endpoint final.
+     * Recreates the recognizer afterward so the next command is clean.
      */
     async transcribe(audio) {
         if (!this._ready || !this._model) {
@@ -292,7 +314,6 @@ export class VoskProvider extends SpeechRecognitionProvider {
             return '';
         }
         this._busy = true;
-        // Ensure we are no longer in live-feed mode
         this._streaming = false;
 
         try {
@@ -312,22 +333,23 @@ export class VoskProvider extends SpeechRecognitionProvider {
             this._resultWaiters.splice(0);
             this._lastFinal = '';
 
-            // If progressive streaming did not cover the segment (or failed),
-            // accept the full VAD segment now so we still produce a result.
-            if (this._streamedSamples < samples.length * 0.5) {
-                this._log('INFO', 'streaming coverage low — accepting full segment for final');
+            // Progressive path only if this utterance was actually streamed.
+            // Otherwise (or if coverage is low) feed the full VAD segment.
+            const covered = this._streamedSamples >= samples.length * 0.5
+                && this._streamedSamples <= samples.length * 1.35;
+            if (!covered) {
+                this._log('INFO', 'streaming coverage mismatch — accepting full segment for final');
                 recognizer.acceptWaveformFloat(samples, this._sampleRate);
             }
 
-            // Endpoint: short silence helps Kaldi finalize the utterance.
-            const silence = new Float32Array(Math.floor(this._sampleRate * 0.3));
+            // Endpoint silence helps Kaldi finalize.
+            const silence = new Float32Array(Math.floor(this._sampleRate * 0.25));
             recognizer.acceptWaveformFloat(silence, this._sampleRate);
 
-            const finalPromise = this._waitNextFinal(10000);
+            const finalPromise = this._waitNextFinal(8000);
             recognizer.retrieveFinalResult();
             const text = await finalPromise;
 
-            // Explicitly discard any lingering partial; only final is authoritative.
             this._lastPartial = '';
             this._streamedSamples = 0;
 
@@ -339,6 +361,9 @@ export class VoskProvider extends SpeechRecognitionProvider {
         } finally {
             this._busy = false;
             this._streaming = false;
+            this._streamedSamples = 0;
+            // Critical: fresh recognizer for the next command
+            try { await this._resetRecognizer(); } catch (_) {}
         }
     }
 
@@ -415,10 +440,12 @@ AkarinetVoice.prototype.init = async function init421() {
         if (this.busVad) {
             this.busVad.on('speech-start', () => {
                 if (typeof this.srProvider.startStreaming === 'function') {
-                    // Only stream after wake when requireWakeSound is enabled
+                    // Only stream after wake when requireWakeSound is enabled.
+                    // Also respect adapter ASR gate (chime/greeting window).
                     const requireWake = !!this.config.requireWakeSound;
                     const hasWake = !!this.wakeSoundDetectedTime;
-                    if (!requireWake || hasWake) {
+                    const gated = typeof window !== 'undefined' && !!window.__ac41AsrBlocked;
+                    if ((!requireWake || hasWake) && !gated) {
                         try { this.srProvider.startStreaming(); } catch (_) {}
                     }
                 }
